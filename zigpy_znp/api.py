@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sys
 import time
 import typing
 import asyncio
@@ -13,12 +12,7 @@ import importlib.metadata
 from collections import Counter, defaultdict
 
 import zigpy.state
-
-if sys.version_info[:2] < (3, 11):
-    from async_timeout import timeout as asyncio_timeout  # pragma: no cover
-else:
-    from asyncio import timeout as asyncio_timeout  # pragma: no cover
-
+import async_timeout
 import zigpy.zdo.types as zdo_t
 import zigpy.exceptions
 from zigpy.exceptions import NetworkNotFormed
@@ -44,7 +38,7 @@ from zigpy_znp.types.nvids import ExNvIds, OsalNvIds
 if typing.TYPE_CHECKING:
     import typing_extensions
 
-LIB_VERSION = importlib.metadata.version("zigpy-znp")
+import json
 LOGGER = logging.getLogger(__name__)
 
 
@@ -155,7 +149,7 @@ class ZNP:
         )
 
         network_info = zigpy.state.NetworkInfo(
-            source=f"zigpy-znp@{LIB_VERSION}",
+            source=f"zigpy-znp@{importlib.metadata.version('zigpy-znp')}",
             extended_pan_id=nib.extendedPANID,
             pan_id=nib.nwkPanId,
             nwk_update_id=nib.nwkUpdateId,
@@ -251,7 +245,6 @@ class ZNP:
         started_as_coordinator = self.wait_for_response(
             c.ZDO.StateChangeInd.Callback(State=t.DeviceState.StartedAsCoordinator)
         )
-
         # Handle the startup progress messages
         async with self.capture_responses(
             [
@@ -278,6 +271,7 @@ class ZNP:
                         ),
                         timeout=NETWORK_COMMISSIONING_TIMEOUT,
                     )
+                    # LOGGER.info(commissioning_rsp)
 
                     # This is the correct startup sequence according to the forums,
                     # including the formation failure error.  Success is only returned
@@ -302,7 +296,7 @@ class ZNP:
                         )
 
                 # Both versions still end with this callback
-                async with asyncio_timeout(STARTUP_TIMEOUT):
+                async with async_timeout.timeout(STARTUP_TIMEOUT):
                     await started_as_coordinator
             except asyncio.TimeoutError as e:
                 raise zigpy.exceptions.FormationFailure(
@@ -323,7 +317,12 @@ class ZNP:
             except KeyError:
                 pass
             else:
-                LOGGER.debug("Current NIB is %s", nib)
+                LOGGER.info("[INITIALIZE] Coordinator NIB Saved!")
+                nib_dict = nib.as_dict()
+                nib_dict["spare1"] = nib_dict["spare1"].as_dict()
+                nib_dict["spare2"] = nib_dict["spare2"].as_dict()
+                with open("gateway_nib.json", "w") as f:
+                    json.dump(nib_dict, f, indent=4)
 
                 # Usually this works after the first attempt
                 if nib.nwkLogicalChannel != 0 and nib.nwkPanId != 0xFFFE:
@@ -637,13 +636,14 @@ class ZNP:
         Performs a soft reset within Z-Stack.
         A hard reset resets the serial port, causing the device to disconnect.
         """
-
         if wait_for_reset:
             await self.request_callback_rsp(
                 request=c.SYS.ResetReq.Req(Type=t.ResetType.Soft),
                 callback=c.SYS.ResetInd.Callback(partial=True),
             )
+            LOGGER.info("[INITIALIZE] Dongle Reset Completed!")
         else:
+            LOGGER.info("[INITIALIZE] Starting Dongle Reset!")
             await self.request(c.SYS.ResetReq.Req(Type=t.ResetType.Soft))
 
     @property
@@ -653,6 +653,7 @@ class ZNP:
     @property
     def _znp_config(self) -> conf.ConfigType:
         return self._config[conf.CONF_ZNP_CONFIG]
+
 
     async def _skip_bootloader(self) -> c.SYS.Ping.Rsp:
         """
@@ -672,7 +673,7 @@ class ZNP:
 
             # First, just try pinging
             try:
-                async with asyncio_timeout(CONNECT_PING_TIMEOUT):
+                async with async_timeout.timeout(CONNECT_PING_TIMEOUT):
                     return await self.request(c.SYS.Ping.Req())
             except asyncio.TimeoutError:
                 pass
@@ -688,7 +689,7 @@ class ZNP:
             # At this point we have nothing left to try
             while True:
                 try:
-                    async with asyncio_timeout(2 * CONNECT_PING_TIMEOUT):
+                    async with async_timeout.timeout(2 * CONNECT_PING_TIMEOUT):
                         return await self.request(c.SYS.Ping.Req())
                 except asyncio.TimeoutError:
                     pass
@@ -697,7 +698,7 @@ class ZNP:
             ping_task = asyncio.create_task(ping_task())
 
             try:
-                async with asyncio_timeout(CONNECT_PROBE_TIMEOUT):
+                async with async_timeout.timeout(CONNECT_PROBE_TIMEOUT):
                     result = await responses.get()
             except Exception:
                 ping_task.cancel()
@@ -712,7 +713,7 @@ class ZNP:
                 LOGGER.debug("Giving ping task %0.2fs to finish", CONNECT_PING_TIMEOUT)
 
                 try:
-                    async with asyncio_timeout(CONNECT_PING_TIMEOUT):
+                    async with async_timeout.timeout(CONNECT_PING_TIMEOUT):
                         result = await ping_task  # type:ignore[misc]
                 except asyncio.TimeoutError:
                     ping_task.cancel()
@@ -740,28 +741,23 @@ class ZNP:
             # prevent any data from being sent
             if test_port:
                 # The reset indication callback is sent when some sticks start up
-                if self._znp_config[conf.CONF_SKIP_BOOTLOADER]:
-                    self.capabilities = (await self._skip_bootloader()).Capabilities
-                else:
-                    self.capabilities = (
-                        await self.request(c.SYS.Ping.Req())
-                    ).Capabilities
+                self.capabilities = (await self._skip_bootloader()).Capabilities
 
                 # We need to know how structs are packed to deserialize frames correctly
                 await self.nvram.determine_alignment()
                 self.version = await self.detect_zstack_version()
 
-                LOGGER.debug("Detected Z-Stack %s", self.version)
+                # LOGGER.info("Detected Z-Stack %s", self.version)
         except (Exception, asyncio.CancelledError):
             LOGGER.debug("Connection to %s failed, cleaning up", self._port_path)
-            await self.disconnect()
+            self.close()
             raise
 
         LOGGER.debug("Connected to %s", self._uart.url)
 
     def connection_made(self) -> None:
         """
-        Called by the UART object to indicate that the port was opened.
+        Called by the UART object when a connection has been made.
         """
 
     def connection_lost(self, exc) -> None:
@@ -792,16 +788,8 @@ class ZNP:
         self.version = None
         self.capabilities = None
 
-    async def disconnect(self) -> None:
-        """
-        Disconnects from the ZNP device.
-        """
-
-        self.close()
-
         if self._uart is not None:
             self._uart.close()
-            await self._uart.wait_until_closed()
             self._uart = None
 
     def remove_listener(self, listener: BaseResponseListener) -> None:
@@ -1072,7 +1060,7 @@ class ZNP:
             self._uart.send(frame)
 
             # We should get a SRSP in a reasonable amount of time
-            async with asyncio_timeout(
+            async with async_timeout.timeout(
                 timeout or self._znp_config[conf.CONF_SREQ_TIMEOUT]
             ):
                 # We lock until either a sync response is seen or an error occurs
@@ -1114,7 +1102,7 @@ class ZNP:
         # Typical request/response/callbacks are not backgrounded
         if not background:
             try:
-                async with asyncio_timeout(timeout):
+                async with async_timeout.timeout(timeout):
                     await self.request(request, timeout=timeout, **response_params)
 
                     return await callback_rsp
@@ -1125,7 +1113,7 @@ class ZNP:
         start_time = time.monotonic()
 
         try:
-            async with asyncio_timeout(timeout):
+            async with async_timeout.timeout(timeout):
                 request_rsp = await self.request(request, **response_params)
         except Exception:
             # If the SREQ/SRSP pair fails, we must cancel the AREQ listener
@@ -1137,7 +1125,7 @@ class ZNP:
         # the timeout
         async def callback_catcher(timeout):
             try:
-                async with asyncio_timeout(timeout):
+                async with async_timeout.timeout(timeout):
                     await callback_rsp
             finally:
                 self.remove_listener(listener)
