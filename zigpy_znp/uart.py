@@ -20,33 +20,50 @@ class BufferTooShort(Exception):
     pass
 
 
-class ZnpMtProtocol(zigpy.serial.SerialProtocol):
+class ZnpMtProtocol(asyncio.Protocol):
     def __init__(self, api, *, url: str | None = None) -> None:
-        super().__init__()
+        self._buffer = bytearray()
         self._api = api
+        self._transport = None
+        self._connected_event = asyncio.Event()
+
         self.url = url
 
     def close(self) -> None:
         """Closes the port."""
-        super().close()
+
         self._api = None
+        self._buffer.clear()
+
+        if self._transport is not None:
+            LOGGER.debug("Closing serial port")
+
+            self._transport.close()
+            self._transport = None
 
     def connection_lost(self, exc: Exception | None) -> None:
         """Connection lost."""
-        super().connection_lost(exc)
+
+        if exc is not None:
+            LOGGER.warning("Lost connection", exc_info=exc)
 
         if self._api is not None:
             self._api.connection_lost(exc)
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        super().connection_made(transport)
+        """Opened serial port."""
+        self._transport = transport
+        LOGGER.debug("Opened %s serial port", self.url)
+
+        self._connected_event.set()
 
         if self._api is not None:
             self._api.connection_made()
 
     def data_received(self, data: bytes) -> None:
         """Callback when data is received."""
-        super().data_received(data)
+        self._buffer += data
+
         LOGGER.log(log.TRACE, "Received data: %s", Bytes.__repr__(data))
 
         for frame in self._extract_frames():
@@ -143,16 +160,27 @@ class ZnpMtProtocol(zigpy.serial.SerialProtocol):
 
 
 async def connect(config: conf.ConfigType, api) -> ZnpMtProtocol:
+    loop = asyncio.get_running_loop()
+
     port = config[zigpy.config.CONF_DEVICE_PATH]
+    baudrate = config[zigpy.config.CONF_DEVICE_BAUDRATE]
+    flow_control = config[zigpy.config.CONF_DEVICE_FLOW_CONTROL]
+
+    # LOGGER.debug("Connecting to %s at %s baud" % (port, baudrate))
+    # print("Connecting to %s at %s baud" % (port, baudrate))
 
     _, protocol = await zigpy.serial.create_serial_connection(
-        loop=asyncio.get_running_loop(),
+        loop=loop,
         protocol_factory=lambda: ZnpMtProtocol(api, url=port),
         url=port,
-        baudrate=config[zigpy.config.CONF_DEVICE_BAUDRATE],
-        flow_control=config[zigpy.config.CONF_DEVICE_FLOW_CONTROL],
+        baudrate=baudrate,
+        xonxoff=(flow_control == "software"),
+        rtscts=(flow_control == "hardware"),
     )
 
-    await protocol.wait_until_connected()
+    await protocol._connected_event.wait()
+
+    LOGGER.info("[+] Connected to %s at %s baud" % (port, baudrate))
+    # print("Connected to %s at %s baud" % (port, baudrate))
 
     return protocol
